@@ -1,0 +1,23 @@
+services:
+  campaign-ai:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: campaign-ai
+    ports:
+      - "8001:8000"
+      - "11434:11434"
+    environment:
+      - PYTHONUNBUFFERED=1
+      - OLLAMA_HOST=0.0.0.0:11434
+      - OLLAMA_MODEL=qwen2.5:0.5b
+      - DATA_ROOT=/app/storage/app/campaign_data
+      - EVENTS_DIR=/app/storage/logs/events
+    volumes:
+      - ollama-data:/root/.ollama
+      # Read-only mount of your Laravel storage:
+      - c:/xampp/htdocs/biling_system/mylinex_billing_system/storage:/app/storage:ro
+    restart: unless-stopped
+
+volumes:
+  ollama-data:
