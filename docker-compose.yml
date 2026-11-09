@@ -17,6 +17,8 @@ services:
       - ollama-data:/root/.ollama
       # Read-only mount of your Laravel storage:
       - c:/xampp/htdocs/biling_system/mylinex_billing_system/storage:/app/storage:ro
+      - ./converter:/app/converter
+      - ./app:/app/app
     restart: unless-stopped
 
 volumes:

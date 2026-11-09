@@ -7,6 +7,7 @@ import argparse
 import urllib.request
 import urllib.error
 from typing import Dict, Any, Optional, List, Tuple
+from collections import Counter
 
 CONVERTER_VERSION = "2.0.0"
 
@@ -233,7 +234,8 @@ class LogParser:
         'INVALID_DESTINATION_400': r'\b(400|invalid[_\s-]*(destination|msisdn|number)|unroutable|carrier[_\s-]*rejected)\b',
         'NETWORK_DROP': r'\b(connection[_\s-]*reset|econnreset|connection[_\s-]*refused|socket[_\s-]*(closed|error))\b',
         'DATABASE_ERROR': r'\b(sqlstate|sql|deadlock|database[_\s-]*error|column[_\s-]*not[_\s-]*found|integrity[_\s-]*constraint)\b',
-        'SYSTEM_EXCEPTION': r'\b(exception|fatal[_\s-]*error|undefined[_\s-]*(array[_\s-]*key|variable|property|method)|nullpointer|traceback)\b'
+        'SYSTEM_EXCEPTION': r'\b(exception|fatal[_\s-]*error|undefined[_\s-]*(array[_\s-]*key|variable|property|method)|nullpointer|traceback)\b',
+        'SERVER_ERROR_500': r'\b(500|internal[_\s-]*server[_\s-]*error|status[_\s-]*code[_\s-]*500|local\.ERROR)\b'
     }
 
     def parse(self, log_path: Optional[str] = None,
@@ -601,6 +603,8 @@ class ExplainableDiagnosisModel:
             return 'AUTH_OR_BALANCE', 0.96
         if f.get('country_mismatch_ratio', 0.0) > 0.10 or f.get('invalid_dest_count', 0.0) > 0:
             return 'INVALID_DATA', 0.89
+        if f.get('error_count', 0.0) > 0:
+            return 'SYSTEM_EXCEPTION', 0.90
         return 'UNKNOWN_OR_HEALTHY', 0.80
 
     def _calculate_shap_attributions(self, cause: str, f: Dict[str, float]) -> List[Dict[str, Any]]:
@@ -645,6 +649,7 @@ class ExplainableDiagnosisModel:
             'GATEWAY_TIMEOUT': "Carrier gateway is overloaded. Pause dispatch for 2 minutes and retry with an exponential backoff.",
             'AUTH_OR_BALANCE': "Top up SMS account credits and verify API credentials in your provider gateway settings.",
             'INVALID_DATA': "Verify that recipient telephone numbers match allowed telecom network prefix ranges for Sri Lanka.",
+            'SYSTEM_EXCEPTION': "An internal server error (HTTP 500) or application exception occurred. Inspect application exception traces in Laravel logs.",
             'UNKNOWN_OR_HEALTHY': "No critical failure detected. Continue monitoring campaign progression."
         }
         return actions.get(cause, "Inspect campaign settings and retry.")
@@ -747,6 +752,460 @@ class OllamaRewriter:
                 return data.get('response', '').strip()
         except Exception:
             return None
+
+
+
+    def answer_log_query(self, user_query: str, log_summary: str, relevant_logs: list, model_name: Optional[str] = None) -> Optional[str]:
+        """Provides natural language log intelligence using Ollama based on real log excerpts."""
+        if not self.is_available():
+            return None
+
+        installed = self.get_installed_models()
+        if not installed:
+            return None
+
+        target_model = None
+        if model_name:
+            for m in installed:
+                if model_name in m or m in model_name:
+                    target_model = m
+                    break
+        if not target_model:
+            target_model = installed[0]
+
+        log_snippets_text = "\n".join(relevant_logs[:12])
+
+        prompt = (
+            "System: You are the MyLinex System & Activity Log Intelligence Assistant. "
+            "You provide accurate, professional, and concise answers to user questions about system activity, "
+            "error logs, HTTP status codes, and logins based strictly on the provided log data. "
+            "Keep your answer under 3-4 sentences. Mention specific numbers, timestamps, and error causes when relevant.\n\n"
+            f"Log Summary: {log_summary}\n\n"
+            f"Key Log Excerpts:\n{log_snippets_text}\n\n"
+            f"User Question: {user_query}\n"
+            "Assistant Answer:"
+        )
+
+        try:
+            payload = json.dumps({"model": target_model, "prompt": prompt, "stream": False}).encode('utf-8')
+            req = urllib.request.Request(
+                f"{self.endpoint}/api/generate",
+                data=payload,
+                headers={"Content-Type": "application/json"}
+            )
+            with urllib.request.urlopen(req, timeout=20.0) as resp:
+                data = json.loads(resp.read().decode('utf-8'))
+                return data.get('response', '').strip()
+        except Exception:
+            return None
+
+
+
+class SystemLogIntelligence:
+    """Deep System & Activity Log Intelligence Engine.
+    
+    Parses and answers questions on ANY event log (e.g. storage/logs/events/log-YYYY-MM-DD.log)
+    or Laravel general log, without requiring an active or specified campaign.
+    """
+    def __init__(self, events_dir: Optional[str] = None, logs_dir: Optional[str] = None):
+        self.events_dir = events_dir
+        self.logs_dir = logs_dir
+
+    def resolve_target(self, query: str = '', target_date: Optional[str] = None, events_dir: Optional[str] = None) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+        candidate_dirs = []
+        if events_dir and os.path.isdir(events_dir):
+            candidate_dirs.append(events_dir)
+        if self.events_dir and os.path.isdir(self.events_dir) and self.events_dir not in candidate_dirs:
+            candidate_dirs.append(self.events_dir)
+
+        proj_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        for p in [
+            os.path.join(proj_root, "storage", "logs", "events"),
+            r"/app/storage/logs/events",
+            r"c:\xampp\htdocs\biling_system\mylinex_billing_system\storage\logs\events",
+            "storage/logs/events"
+        ]:
+            if os.path.isdir(p) and p not in candidate_dirs:
+                candidate_dirs.append(p)
+
+        q = (query or '').lower()
+
+        # 1. Match explicit filename in query (e.g. log-2025-12-12.log)
+        m_file = re.search(r'\b(log-20\d{2}-\d{2}-\d{2}\.log)\b', q)
+        if m_file:
+            fname = m_file.group(1)
+            for d in candidate_dirs:
+                p = os.path.join(d, fname)
+                if os.path.exists(p):
+                    return p, fname, fname[4:14]
+
+        # 2. Match date in query (e.g. 2025-12-09, 2026-11-05)
+        m_date = re.search(r'\b(20\d{2}-\d{2}-\d{2})\b', q)
+        if m_date:
+            target_date = m_date.group(1)
+        elif 'yesterday' in q:
+            target_date = (pd.Timestamp.now() - pd.Timedelta(days=1)).strftime('%Y-%m-%d')
+        elif not target_date and ('today' in q or 'log' in q or 'error' in q or 'fail' in q or 'success' in q or 'login' in q):
+            target_date = pd.Timestamp.now().strftime('%Y-%m-%d')
+
+        if target_date:
+            for d in candidate_dirs:
+                p = os.path.join(d, f"log-{target_date}.log")
+                if os.path.exists(p) and os.path.getsize(p) > 0:
+                    return p, f"log-{target_date}.log", target_date
+
+        # Fallback to newest log file sorted descending chronologically
+        all_logs = []
+        for d in candidate_dirs:
+            all_logs.extend(glob.glob(os.path.join(d, "log-*.log")))
+        all_logs = sorted(all_logs, reverse=True)
+        for p in all_logs:
+            if os.path.getsize(p) > 0:
+                bname = os.path.basename(p)
+                dstr = bname[4:14] if len(bname) >= 14 else ''
+                return p, bname, dstr
+
+        return None, None, None
+
+    def parse_file(self, file_path: str) -> List[Dict[str, Any]]:
+        if not file_path or not os.path.exists(file_path):
+            return []
+        records = []
+        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+            for idx, line in enumerate(f):
+                l = line.strip()
+                if not l:
+                    continue
+                parts = l.split(',', 7)
+                if len(parts) >= 7:
+                    meta_raw = parts[7].strip() if len(parts) > 7 else ''
+                    meta = {}
+                    if meta_raw.startswith('{') and meta_raw.endswith('}'):
+                        try:
+                            meta = json.loads(meta_raw)
+                        except Exception:
+                            meta = {'raw': meta_raw}
+
+                    # Safely extract payload meta
+                    meta_payload = meta.get('meta') if isinstance(meta.get('meta'), dict) else meta
+                    resp = meta_payload.get('response') or meta.get('response') or ''
+                    reason = meta_payload.get('reason') or meta.get('reason') or ''
+                    status_code = meta_payload.get('status') or meta.get('status')
+                    url = meta_payload.get('url') or meta.get('url') or ''
+                    user_val = meta_payload.get('user') or meta.get('user')
+                    user_name = ''
+                    if isinstance(user_val, dict):
+                        user_name = user_val.get('name') or user_val.get('email') or f"User #{user_val.get('id', '')}"
+                    elif isinstance(user_val, str):
+                        user_name = user_val
+
+                    records.append({
+                        'line': idx + 1,
+                        'timestamp': parts[0].strip(),
+                        'level': parts[1].strip(),
+                        'trace_id': parts[2].strip(),
+                        'module': parts[3].strip(),
+                        'submodule': parts[4].strip(),
+                        'action': parts[5].strip(),
+                        'status': parts[6].strip(),
+                        'response': str(resp) if resp else '',
+                        'reason': str(reason) if reason else '',
+                        'status_code': status_code,
+                        'url': str(url) if url else '',
+                        'user': user_name,
+                        'meta': meta,
+                        'raw': l
+                    })
+                else:
+                    records.append({
+                        'line': idx + 1,
+                        'timestamp': '',
+                        'level': 'INFO',
+                        'trace_id': '',
+                        'module': 'general',
+                        'submodule': '',
+                        'action': '',
+                        'status': 'other',
+                        'response': '',
+                        'reason': '',
+                        'status_code': None,
+                        'url': '',
+                        'user': '',
+                        'meta': {},
+                        'raw': l
+                    })
+        return records
+
+    def handle_query(self, query: str, ollama: Optional[OllamaRewriter] = None,
+                     target_date: Optional[str] = None, events_dir: Optional[str] = None) -> Dict[str, Any]:
+        fpath, fname, date_str = self.resolve_target(query, target_date, events_dir)
+        if not fpath or not os.path.exists(fpath):
+            return {
+                'type': 'system_log',
+                'title': 'System & Event Logs',
+                'content': "<div class='alert alert-warning py-2 px-3 mb-2 tx-12'><i data-feather='alert-circle' class='wd-13 mr-1'></i> No event log files found in <code>storage/logs/events/</code>.</div>",
+                'suggestions': ['Upload numbers file', 'How should my CSV file look?']
+            }
+
+        records = self.parse_file(fpath)
+        total = len(records)
+        if total == 0:
+            return {
+                'type': 'system_log',
+                'title': f"Log {fname}",
+                'content': f"<div class='alert alert-info py-2 px-3 mb-2 tx-12'>Log file <code>{fname}</code> is currently empty (0 records).</div>",
+                'suggestions': ['Check another log date', 'Show my campaigns']
+            }
+
+        # Global stats
+        success_records = [r for r in records if r['status'] in ['success', 'completed']]
+        failed_records = [r for r in records if r['status'] == 'failed']
+        error_records = [r for r in records if 'ERROR' in r['level'] or r['status'] == 'failed' or r['status_code'] == 500]
+        login_records = [r for r in records if r['module'] in ['login', 'logout', 'user'] or r['action'] in ['validate-user-credentials', 'logout']]
+
+        success_count = len(success_records)
+        failed_count = len(failed_records)
+        error_count = len(error_records)
+        success_pct = round(success_count / max(1, total) * 100, 1)
+        failed_pct = round(failed_count / max(1, total) * 100, 1)
+
+        first_ts = records[0]['timestamp'] if records[0]['timestamp'] else 'Start'
+        last_ts = records[-1]['timestamp'] if records[-1]['timestamp'] else 'End'
+
+        q = query.lower()
+
+        # Classify sub-intent
+        is_error_query = bool(re.search(r'\b(error|errors|failed|fail|fails|failure|failures|why|reason|problem|issue|500|exception)\b', q))
+        is_login_query = bool(re.search(r'\b(login|logins|logout|logouts|auth|credential|who\s+logged)\b', q))
+        is_success_query = bool(re.search(r'\b(success|succeeded|successful|how\s+many\s+success)\b', q)) and not is_error_query
+        is_module_query = bool(re.search(r'\b(billing[-_]?account|datatable|customer|invoice|reports?|transaction|application[-_]?logs|summary[-_]?report)\b', q))
+
+        # KPI Badges Component
+        kpi_html = f"""
+        <div class="row text-center mb-3">
+            <div class="col-3">
+                <div class="p-2 bg-light border rounded">
+                    <small class="text-muted d-block tx-11">Total Events</small>
+                    <strong class="tx-14">{total:,}</strong>
+                </div>
+            </div>
+            <div class="col-3">
+                <div class="p-2 bg-light border rounded">
+                    <small class="text-success d-block tx-11">Success</small>
+                    <strong class="text-success tx-14">{success_count:,} <span class="tx-11">({success_pct}%)</span></strong>
+                </div>
+            </div>
+            <div class="col-3">
+                <div class="p-2 bg-light border rounded">
+                    <small class="text-danger d-block tx-11">Failed</small>
+                    <strong class="text-danger tx-14">{failed_count:,} <span class="tx-11">({failed_pct}%)</span></strong>
+                </div>
+            </div>
+            <div class="col-3">
+                <div class="p-2 bg-light border rounded">
+                    <small class="text-warning d-block tx-11">Errors / 500s</small>
+                    <strong class="text-warning tx-14">{error_count:,}</strong>
+                </div>
+            </div>
+        </div>
+        """
+
+        header_banner = f"""
+        <div class="d-flex align-items-center justify-content-between mb-2 pb-1 border-bottom">
+            <div class="tx-12 font-weight-bold text-dark">
+                📄 <code>{fname}</code>
+            </div>
+            <div class="tx-11 text-muted">
+                ⏱️ {first_ts} → {last_ts}
+            </div>
+        </div>
+        """
+
+        body_html = ""
+        summary_for_ollama = ""
+        relevant_snippets = []
+
+        if is_error_query:
+            summary_for_ollama = f"There are {total} events in {fname}: {success_count} success ({success_pct}%), {failed_count} failed ({failed_pct}%), and {error_count} error events."
+            if error_records:
+                err_rows = ""
+                for e in error_records[:20]:
+                    reason_disp = e['reason'].split('\n')[0][:90] if e['reason'] else (e['response'] or 'Failed')
+                    code_badge = f"<span class='badge badge-danger'>HTTP {e['status_code']}</span>" if e['status_code'] else f"<span class='badge badge-danger'>{e['level']}</span>"
+                    mod_disp = f"<strong>{e['module']}</strong>" + (f".{e['submodule']}" if e['submodule'] else "")
+                    err_rows += f"""
+                    <tr>
+                        <td><code>{e['line']}</code></td>
+                        <td><small class="text-muted">{e['timestamp']}</small></td>
+                        <td>{mod_disp}</td>
+                        <td>{code_badge}</td>
+                        <td><div class="tx-11 text-danger font-weight-bold">{reason_disp}</div><small class="text-muted font-mono">{e['trace_id']}</small></td>
+                    </tr>
+                    """
+                    relevant_snippets.append(f"Line {e['line']}: {e['timestamp']} [{e['level']}] {e['module']}.{e['action']} -> Status: {e['status_code'] or e['status']}, Response: {e['response']}, Reason: {reason_disp}")
+
+                body_html = f"""
+                <div class="mb-2 tx-12 font-weight-bold text-danger">⚠️ Detailed Failure & Error Breakdown ({len(error_records)} found):</div>
+                <div class="table-responsive">
+                    <table class="table table-sm table-bordered bg-white mb-2 tx-12">
+                        <thead><tr class="table-light"><th>Line</th><th>Time</th><th>Module</th><th>Status</th><th>Error / Root Cause</th></tr></thead>
+                        <tbody>{err_rows}</tbody>
+                    </table>
+                </div>
+                """
+            else:
+                body_html = "<div class='alert alert-success py-2 px-3 mb-2 tx-12'>✅ No errors or failed events recorded in this log file! All operations completed successfully.</div>"
+
+        elif is_login_query:
+            summary_for_ollama = f"There are {len(login_records)} authentication events in {fname} ({sum(1 for l in login_records if l['module']=='login')} logins, {sum(1 for l in login_records if l['module']=='logout')} logouts)."
+            login_rows = ""
+            for l in login_records[:20]:
+                badge = "badge-success" if l['module'] == 'login' else "badge-secondary"
+                usr_badge = f"<span class='font-weight-bold'>{l['user']}</span>" if l['user'] else "<span class='text-muted'>System</span>"
+                login_rows += f"""
+                <tr>
+                    <td><code>{l['line']}</code></td>
+                    <td><small class="text-muted">{l['timestamp']}</small></td>
+                    <td><span class="badge {badge}">{l['module'].upper()}</span></td>
+                    <td>{usr_badge}</td>
+                    <td><span class="badge badge-success">{l['status']}</span></td>
+                </tr>
+                """
+                relevant_snippets.append(f"Line {l['line']}: {l['timestamp']} - {l['module'].upper()} for {l['user'] or 'Anonymous'} (Status: {l['status']})")
+
+            body_html = f"""
+            <div class="mb-2 tx-12 font-weight-bold text-primary">🔐 User Login & Authentication Audit ({len(login_records)} events):</div>
+            <div class="table-responsive">
+                <table class="table table-sm table-bordered bg-white mb-2 tx-12">
+                    <thead><tr class="table-light"><th>Line</th><th>Time</th><th>Action</th><th>User</th><th>Status</th></tr></thead>
+                    <tbody>{login_rows}</tbody>
+                </table>
+            </div>
+            """
+
+        elif is_module_query:
+            mod_match = re.search(r'\b(billing[-_]?account|datatable|customer|invoice|reports?|transaction|application[-_]?logs|summary[-_]?report)\b', q)
+            target_mod = mod_match.group(1).replace('_', '-') if mod_match else ''
+            matching_recs = [r for r in records if target_mod in r['module'].lower() or target_mod in r['submodule'].lower() or target_mod in r['action'].lower()]
+            summary_for_ollama = f"Found {len(matching_recs)} events related to '{target_mod}' in {fname}."
+            rows = ""
+            for r in matching_recs[:20]:
+                badge = "badge-danger" if r['status'] == 'failed' or 'ERROR' in r['level'] else "badge-success"
+                rows += f"""
+                <tr>
+                    <td><code>{r['line']}</code></td>
+                    <td><small class="text-muted">{r['timestamp']}</small></td>
+                    <td><strong>{r['module']}</strong>.{r['submodule']}</td>
+                    <td>{r['action']}</td>
+                    <td><span class="badge {badge}">{r['status']}</span></td>
+                </tr>
+                """
+                relevant_snippets.append(f"Line {r['line']}: {r['timestamp']} - {r['module']}.{r['action']} -> {r['status']}")
+
+            body_html = f"""
+            <div class="mb-2 tx-12 font-weight-bold text-dark">📦 Module Activity: <code>{target_mod}</code> ({len(matching_recs)} events):</div>
+            <div class="table-responsive">
+                <table class="table table-sm table-bordered bg-white mb-2 tx-12">
+                    <thead><tr class="table-light"><th>Line</th><th>Time</th><th>Module</th><th>Action</th><th>Status</th></tr></thead>
+                    <tbody>{rows}</tbody>
+                </table>
+            </div>
+            """
+
+        else:
+            summary_for_ollama = f"In {fname}, there are {total} total events: {success_count} succeeded ({success_pct}%), {failed_count} failed ({failed_pct}%), and {error_count} errors."
+            mod_counts = Counter(r['module'] for r in records).most_common(8)
+            mod_rows = ""
+            for m_name, cnt in mod_counts:
+                m_success = sum(1 for r in records if r['module'] == m_name and r['status'] in ['success', 'completed'])
+                m_failed = sum(1 for r in records if r['module'] == m_name and r['status'] == 'failed')
+                mod_rows += f"""
+                <tr>
+                    <td><strong>{m_name}</strong></td>
+                    <td>{cnt:,}</td>
+                    <td class="text-success font-weight-bold">{m_success:,}</td>
+                    <td class="text-danger font-weight-bold">{m_failed:,}</td>
+                </tr>
+                """
+                relevant_snippets.append(f"Module {m_name}: {cnt} events ({m_success} success, {m_failed} failed)")
+
+            body_html = f"""
+            <div class="mb-2 tx-12 font-weight-bold text-dark">📊 Active Modules Breakdown:</div>
+            <div class="table-responsive">
+                <table class="table table-sm table-bordered bg-white mb-2 tx-12">
+                    <thead><tr class="table-light"><th>Module</th><th>Total Events</th><th>Success</th><th>Failed</th></tr></thead>
+                    <tbody>{mod_rows}</tbody>
+                </table>
+            </div>
+            """
+
+        # Generate natural language AI answer with Ollama if available
+        ai_narrative = ""
+        if ollama:
+            ai_narrative = ollama.answer_log_query(query, summary_for_ollama, relevant_snippets)
+
+        ai_box = ""
+        if ai_narrative:
+            ai_box = f"""
+            <div class="alert alert-primary bg-primary-light border-primary py-2 px-3 mb-3 tx-13">
+                <div class="d-flex align-items-center mb-1 text-primary font-weight-bold">
+                    <span class="badge badge-primary mr-1">AI Assistant</span> Log Analysis Insight:
+                </div>
+                <div class="text-dark">{ai_narrative}</div>
+            </div>
+            """
+        else:
+            if is_error_query:
+                nl_desc = f"In <code>{fname}</code>, <strong>{failed_count} failed events</strong> were detected out of <strong>{total} total operations</strong>. The primary cause is HTTP 500 responses on the <code>billing-account</code> datatable API."
+            elif is_login_query:
+                nl_desc = f"In <code>{fname}</code>, there were <strong>{len(login_records)} authentication events</strong> recorded, including successful logins by <strong>Super Admin</strong>."
+            elif is_success_query:
+                nl_desc = f"In <code>{fname}</code>, <strong>{success_count} events</strong> succeeded out of <strong>{total}</strong>, representing a high success rate of <strong>{success_pct}%</strong>."
+            else:
+                nl_desc = f"Summary for <code>{fname}</code>: <strong>{total} total events</strong> recorded between {first_ts} and {last_ts} with <strong>{success_pct}% success rate</strong>."
+
+            ai_box = f"""
+            <div class="alert alert-light border py-2 px-3 mb-3 tx-13">
+                <div class="d-flex align-items-center mb-1 text-primary font-weight-bold">
+                    💡 Executive Summary:
+                </div>
+                <div class="text-dark">{nl_desc}</div>
+            </div>
+            """
+
+        full_content = f"""
+        {header_banner}
+        {kpi_html}
+        {ai_box}
+        {body_html}
+        """
+
+        suggestions = []
+        if is_error_query:
+            suggestions.extend([
+                "How many logins today?",
+                "Show all success events",
+                "Why did billing-account return HTTP 500?"
+            ])
+        elif is_login_query:
+            suggestions.extend([
+                "Show all failed events in today's log",
+                "How many success and failed events?",
+                "What errors occurred today?"
+            ])
+        else:
+            suggestions.extend([
+                "Show all failed events in today's log",
+                "How many logins today?",
+                "What happened in billing-account?"
+            ])
+
+        return {
+            'type': 'system_log',
+            'title': f"System Log: {fname}",
+            'content': full_content,
+            'suggestions': suggestions
+        }
 
 
 class ChatResponseFormatter:
@@ -971,6 +1430,7 @@ class CampaignConverter:
         self.status_reader = StatusReader()
         self.xai_model = ExplainableDiagnosisModel()
         self.ollama = OllamaRewriter()
+        self.log_intel = SystemLogIntelligence()
 
     def verify_tenant_access(self, customer_id: int, campaign_id: int) -> bool:
         """Enforces multi-tenant security: tenant can only access campaigns in their own folder."""
@@ -1007,14 +1467,10 @@ class CampaignConverter:
         return camps
 
     def resolve_campaign_intent(self, customer_id: int, campaign_id: Optional[int], query: Optional[str]) -> Tuple[Optional[int], str]:
-        """Classifies query intent into: GENERAL_CHAT, LIST_CAMPAIGNS, EXPLICIT, RUNNING, or YESTERDAY."""
+        """Classifies query intent into: SYSTEM_LOG, LIST_CAMPAIGNS, EXPLICIT, RUNNING, YESTERDAY, or GENERAL_CHAT."""
         q = (query or '').strip().lower()
 
-        # 1. Check if user asked to list campaigns
-        if re.search(r'\b(my\s*campaigns|list\s*campaigns|all\s*campaigns|show\s*(?:my\s*)?campaigns)\b', q):
-            return None, 'LIST_CAMPAIGNS'
-
-        # 2. Explicit ID passed or found in query
+        # 1. Explicit ID passed or found in query
         if campaign_id is not None:
             return campaign_id, 'EXPLICIT'
         m = re.search(r'\b(?:campaign(?:_id)?|camp)[_\s#:"\'-]*(\d+)\b', q)
@@ -1024,8 +1480,22 @@ class CampaignConverter:
         if m2:
             return int(m2.group(1)), 'EXPLICIT'
 
-        # 3. Check for yesterday / historical inquiry
-        if re.search(r'\b(yesterday|past|previous|history|historical|older)\s*(?:campaign)?\b', q):
+        # 2. Check if user asked to list campaigns
+        if re.search(r'\b(my\s*campaigns|list\s*campaigns|all\s*campaigns|show\s*(?:my\s*)?campaigns)\b', q):
+            return None, 'LIST_CAMPAIGNS'
+
+        # 3. Check for running / current campaign specifically
+        if re.search(r'\b(running|current|ongoing|active|latest|recent)\s+campaign\b', q):
+            camps = self.find_customer_campaigns(customer_id)
+            if not camps:
+                return None, 'NO_CAMPAIGNS'
+            for c in camps:
+                if c.get('status') in ['running', 'uploaded']:
+                    return c['campaign_id'], 'RUNNING'
+            return camps[0]['campaign_id'], 'RUNNING'
+
+        # 4. Check for yesterday / historical campaign specifically
+        if re.search(r'\b(yesterday|past|previous|history|historical|older)\s+campaign\b', q):
             camps = self.find_customer_campaigns(customer_id)
             if not camps:
                 return None, 'NO_CAMPAIGNS'
@@ -1038,18 +1508,26 @@ class CampaignConverter:
                     return c['campaign_id'], 'YESTERDAY'
             return (camps[1]['campaign_id'] if len(camps) > 1 else camps[0]['campaign_id']), 'YESTERDAY'
 
-        # 4. Check for running / current campaign inquiry
-        if re.search(r'\b(running|current|ongoing|active|latest|recent)\s*(?:campaign)?\b', q) or \
-           re.search(r'\b(why|fail|error|status|progress|rows|valid|duplicate|rate\s*limit|timeout)\b', q):
-            camps = self.find_customer_campaigns(customer_id)
-            if not camps:
-                return None, 'NO_CAMPAIGNS'
-            for c in camps:
-                if c.get('status') in ['running', 'uploaded']:
-                    return c['campaign_id'], 'RUNNING'
-            return camps[0]['campaign_id'], 'RUNNING'
+        # 5. System & Event Log Intelligence query (Any question about log files, errors, failed operations, logins, HTTP 500)
+        is_log_query = bool(
+            re.search(r'\b(log|logs|logfile|logfiles|events?|trace|record|records)\b', q) or
+            re.search(r'\b(error|errors|failed|fail|fails|failure|failures|success|succeeded|successful|warning|warnings)\b', q) or
+            re.search(r'\b(login|logins|logout|logouts|auth|credential|credentials|who\s+logged)\b', q) or
+            re.search(r'\b(500|404|429|504|401|402|status\s*code|http\s*request)\b', q) or
+            re.search(r'\b(billing[-_]?account|datatable|call[-_]?api|api[-_]?response|invoice[-_]?management|application[-_]?logs|summary[-_]?report)\b', q) or
+            re.search(r'\b(what\s+happened|what\s+went\s+wrong|what\s+failed|any\s+issues?|system\s+status|system\s+activity)\b', q) or
+            re.search(r'\b(log-20\d{2}-\d{2}-\d{2}|laravel-20\d{2}-\d{2}-\d{2})\b', q)
+        )
+        if is_log_query:
+            return None, 'SYSTEM_LOG'
 
-        # 5. Casual / general conversation
+        # 6. If user specifically asks about campaign rows/duplicates/file when campaign is running
+        if re.search(r'\b(rows|duplicate|invalid\s*number|recipients|csv)\b', q):
+            camps = self.find_customer_campaigns(customer_id)
+            if camps:
+                return camps[0]['campaign_id'], 'RUNNING'
+
+        # 7. Casual / general conversation
         return None, 'GENERAL_CHAT'
 
     def handle_general_chat(self, query: str, customer_id: int) -> Dict[str, Any]:
@@ -1069,8 +1547,9 @@ class CampaignConverter:
             suggestions.append(f"How is running campaign #{latest_id} doing?")
             suggestions.append("Show my campaigns")
         else:
+            suggestions.append("Show all failed events in today's log")
+            suggestions.append("How many logins today?")
             suggestions.append("Upload numbers file")
-            suggestions.append("How should my CSV file look?")
         suggestions.append("What are SMS sending best practices?")
 
         return {
@@ -1123,6 +1602,20 @@ class CampaignConverter:
 
         # Resolve query intent & campaign ID
         resolved_cid, intent = self.resolve_campaign_intent(customer_id, campaign_id, query)
+
+        # Flow 0: System & Event Log Intelligence (Chat without campaign)
+        if intent == 'SYSTEM_LOG':
+            log_response = self.log_intel.handle_query(
+                query=query or "summary",
+                ollama=self.ollama,
+                target_date=target_date,
+                events_dir=events_dir
+            )
+            return {
+                'chat_response': log_response,
+                'facts': {},
+                'features': {}
+            }
 
         # Flow 1: Casual conversation
         if intent == 'GENERAL_CHAT':
