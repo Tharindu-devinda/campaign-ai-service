@@ -936,8 +936,212 @@ class SystemLogIntelligence:
                     })
         return records
 
+    @staticmethod
+    def extract_trace_id(query: str) -> Optional[str]:
+        q = (query or '').strip()
+        m = re.search(r'\b(?:trace(?:_id)?|request(?:_id)?|event(?:_id)?)[_\s#:=]*([0-9a-zA-Z_-]{8,40})\b', q, re.I)
+        if m:
+            return m.group(1).strip()
+        m13 = re.search(r'\b([0-9a-f]{13})\b', q, re.I)
+        if m13:
+            return m13.group(1).strip()
+        muuid = re.search(r'\b([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b', q, re.I)
+        if muuid:
+            return muuid.group(1).strip()
+        return None
+
+    def search_trace_across_logs(self, trace_id: str, events_dir: Optional[str] = None) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+        candidate_dirs = []
+        if events_dir and os.path.isdir(events_dir):
+            candidate_dirs.append(events_dir)
+        if self.events_dir and os.path.isdir(self.events_dir) and self.events_dir not in candidate_dirs:
+            candidate_dirs.append(self.events_dir)
+
+        proj_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        for p in [
+            os.path.join(proj_root, "storage", "logs", "events"),
+            r"/app/storage/logs/events",
+            r"c:\xampp\htdocs\biling_system\mylinex_billing_system\storage\logs\events",
+            "storage/logs/events"
+        ]:
+            if os.path.isdir(p) and p not in candidate_dirs:
+                candidate_dirs.append(p)
+
+        all_files = []
+        for d in candidate_dirs:
+            all_files.extend(glob.glob(os.path.join(d, "log-*.log")))
+        all_files = sorted(all_files, reverse=True)
+
+        for fpath in all_files:
+            matches = []
+            with open(fpath, 'r', encoding='utf-8', errors='ignore') as f:
+                for idx, line in enumerate(f):
+                    if trace_id in line:
+                        parts = line.strip().split(',', 7)
+                        if len(parts) >= 7 and parts[2].strip() == trace_id:
+                            meta = {}
+                            if len(parts) > 7 and parts[7].strip().startswith('{'):
+                                try:
+                                    meta = json.loads(parts[7].strip())
+                                except Exception:
+                                    meta = {'raw': parts[7].strip()}
+                            matches.append({
+                                'line': idx + 1,
+                                'timestamp': parts[0].strip(),
+                                'level': parts[1].strip(),
+                                'trace_id': parts[2].strip(),
+                                'module': parts[3].strip(),
+                                'submodule': parts[4].strip(),
+                                'action': parts[5].strip(),
+                                'status': parts[6].strip(),
+                                'meta': meta,
+                                'raw': line.strip()
+                            })
+            if matches:
+                return matches, os.path.basename(fpath)
+
+        return [], None
+
+    def handle_trace_query(self, trace_id: str, query: str, ollama: Optional[OllamaRewriter] = None, events_dir: Optional[str] = None) -> Dict[str, Any]:
+        matches, fname = self.search_trace_across_logs(trace_id, events_dir)
+        if not matches:
+            return {
+                'type': 'system_log',
+                'title': f"Trace #{trace_id}",
+                'content': f"""
+                <div class="alert alert-warning py-2 px-3 mb-2 tx-12">
+                    <i data-feather="search" class="wd-13 mr-1"></i>
+                    No event log records found matching Trace / Request ID: <code>{trace_id}</code> across available logs in <code>storage/logs/events/</code>.
+                </div>
+                <div class="tx-12 text-muted">Please verify the trace ID or try asking for recent errors or logins.</div>
+                """,
+                'suggestions': ["Show all failed events in today's log", "How many logins today?", "System event log summary"]
+            }
+
+        first_m = matches[0]
+        has_failure = any(m['status'] == 'failed' or 'ERROR' in m['level'] for m in matches)
+        status_badge = "<span class='badge badge-danger px-2 py-1 tx-12 mr-2'>FAILED</span>" if has_failure else "<span class='badge badge-success px-2 py-1 tx-12 mr-2'>SUCCESS</span>"
+
+        users = []
+        urls = []
+        responses = []
+        reasons = []
+        http_codes = []
+
+        for m in matches:
+            meta = m['meta']
+            payload = meta.get('meta') if isinstance(meta.get('meta'), dict) else meta
+            usr = payload.get('user')
+            if usr:
+                if isinstance(usr, dict):
+                    u_name = usr.get('name') or usr.get('email') or f"User #{usr.get('id', '')}"
+                    if u_name and u_name not in users: users.append(u_name)
+                elif isinstance(usr, str) and usr not in users:
+                    users.append(usr)
+            if payload.get('url') and payload.get('url') not in urls:
+                urls.append(payload.get('url'))
+            if payload.get('response') and payload.get('response') not in responses:
+                responses.append(payload.get('response'))
+            if payload.get('reason'):
+                reasons.append(payload.get('reason'))
+            if payload.get('status'):
+                http_codes.append(payload.get('status'))
+
+        lines_str = f"Line {matches[0]['line']}" if len(matches) == 1 else f"Lines {matches[0]['line']}–{matches[-1]['line']}"
+
+        header = f"""
+        <div class="d-flex align-items-center justify-content-between mb-2 pb-1 border-bottom">
+            <div class="tx-12 font-weight-bold text-dark">
+                🔍 Trace / Request ID: <code class="tx-13 text-primary">{trace_id}</code>
+            </div>
+            <div class="tx-11 text-muted">
+                📄 <code>{fname}</code> ({lines_str})
+            </div>
+        </div>
+        <div class="mb-3 d-flex align-items-center">
+            {status_badge}
+            <span class="tx-12 text-muted">Module: <strong>{first_m['module']}</strong> • {len(matches)} recorded step(s)</span>
+        </div>
+        """
+
+        if has_failure:
+            code_str = f"HTTP {http_codes[0]}" if http_codes else "Error"
+            first_reason = reasons[0].split('\n')[0][:95] if reasons else (responses[0] if responses else 'Execution failed')
+            ai_box = f"""
+            <div class="alert alert-danger py-2 px-3 mb-3 tx-13">
+                <div class="d-flex align-items-center mb-1 text-danger font-weight-bold">
+                    ⚠️ Request Failed ({code_str}):
+                </div>
+                <div class="text-dark">
+                    This request on <strong>{first_m['timestamp']}</strong> in module <code>{first_m['module']}</code> failed.<br>
+                    <strong>Reason:</strong> {first_reason}
+                </div>
+            </div>
+            """
+        else:
+            user_str = f" by user <strong>{users[0]}</strong>" if users else ""
+            resp_str = f" Response: <em>'{responses[0]}'</em>" if responses else ""
+            ai_box = f"""
+            <div class="alert alert-success bg-success-light border-success py-2 px-3 mb-3 tx-13">
+                <div class="d-flex align-items-center mb-1 text-success font-weight-bold">
+                    ✅ Request Completed Successfully:
+                </div>
+                <div class="text-dark">
+                    Executed on <strong>{first_m['timestamp']}</strong> in module <code>{first_m['module']}</code>{user_str}.{resp_str}
+                </div>
+            </div>
+            """
+
+        step_rows = ""
+        for m in matches:
+            b_class = "badge-danger" if m['status'] == 'failed' or 'ERROR' in m['level'] else "badge-success"
+            m_payload = m['meta'].get('meta') if isinstance(m['meta'].get('meta'), dict) else m['meta']
+            desc = m_payload.get('response') or m_payload.get('reason') or ''
+            if isinstance(desc, str):
+                desc = desc.split('\n')[0][:80]
+            step_rows += f"""
+            <tr>
+                <td><code>{m['line']}</code></td>
+                <td><small class="text-muted">{m['timestamp']}</small></td>
+                <td><strong>{m['module']}</strong>.{m['action'] or m['submodule']}</td>
+                <td><span class="badge {b_class}">{m['status']}</span></td>
+                <td><small class="text-muted">{desc}</small></td>
+            </tr>
+            """
+
+        steps_table = f"""
+        <div class="tx-11 text-uppercase font-weight-bold text-muted mb-1">Execution Steps:</div>
+        <div class="table-responsive">
+            <table class="table table-sm table-bordered bg-white mb-2 tx-12">
+                <thead><tr class="table-light"><th>Line</th><th>Time</th><th>Action</th><th>Status</th><th>Details</th></tr></thead>
+                <tbody>{step_rows}</tbody>
+            </table>
+        </div>
+        """
+
+        full_content = f"{header}\n{ai_box}\n{steps_table}"
+
+        suggestions = [
+            "Show all failed events in today's log",
+            "How many logins today?",
+            "System event log summary"
+        ]
+        if first_m['module'] == 'billing-account':
+            suggestions.insert(0, "Why did billing-account return HTTP 500?")
+
+        return {
+            'type': 'system_log',
+            'title': f"Trace #{trace_id}",
+            'content': full_content,
+            'suggestions': suggestions
+        }
+
     def handle_query(self, query: str, ollama: Optional[OllamaRewriter] = None,
                      target_date: Optional[str] = None, events_dir: Optional[str] = None) -> Dict[str, Any]:
+        # Direct trace ID lookup if specified
+        trace_id = self.extract_trace_id(query)
+        if trace_id:
+            return self.handle_trace_query(trace_id, query, ollama, events_dir)
         fpath, fname, date_str = self.resolve_target(query, target_date, events_dir)
         if not fpath or not os.path.exists(fpath):
             return {
@@ -1508,7 +1712,11 @@ class CampaignConverter:
                     return c['campaign_id'], 'YESTERDAY'
             return (camps[1]['campaign_id'] if len(camps) > 1 else camps[0]['campaign_id']), 'YESTERDAY'
 
-        # 5. System & Event Log Intelligence query (Any question about log files, errors, failed operations, logins, HTTP 500)
+        # 5. Check if query is looking up a specific Trace ID / Request ID (e.g. 6937bd29daf13)
+        if SystemLogIntelligence.extract_trace_id(query or ''):
+            return None, 'SYSTEM_LOG'
+
+        # 6. System & Event Log Intelligence query (Any question about log files, errors, failed operations, logins, HTTP 500)
         is_log_query = bool(
             re.search(r'\b(log|logs|logfile|logfiles|events?|trace|record|records)\b', q) or
             re.search(r'\b(error|errors|failed|fail|fails|failure|failures|success|succeeded|successful|warning|warnings)\b', q) or
